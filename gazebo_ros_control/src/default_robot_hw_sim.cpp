@@ -42,7 +42,6 @@
 #include <gazebo_ros_control/default_robot_hw_sim.h>
 #include <urdf/model.h>
 
-
 namespace
 {
 
@@ -56,6 +55,13 @@ double clamp(const double val, const double min_val, const double max_val)
 namespace gazebo_ros_control
 {
 
+DefaultRobotHWSim::~DefaultRobotHWSim()
+{
+  for (int i = 0; i < joint_handles_.size(); ++i)
+    if (joint_handles_[i]) delete joint_handles_[i];
+  for (int i = 0; i < pos_vel_joint_handles_.size(); ++i)
+    if (pos_vel_joint_handles_[i]) delete pos_vel_joint_handles_[i];
+}
 
 bool DefaultRobotHWSim::initSim(
   const std::string& robot_namespace,
@@ -149,30 +155,47 @@ bool DefaultRobotHWSim::initSim(
         joint_names_[j], &joint_position_[j], &joint_velocity_[j], &joint_effort_[j]));
 
     // Decide what kind of command interface this actuator/joint has
-    hardware_interface::JointHandle joint_handle;
+    hardware_interface::JointHandle *joint_handle = nullptr;
     if(hardware_interface == "EffortJointInterface" || hardware_interface == "hardware_interface/EffortJointInterface")
     {
       // Create effort joint interface
       joint_control_methods_[j] = EFFORT;
-      joint_handle = hardware_interface::JointHandle(js_interface_.getHandle(joint_names_[j]),
-                                                     &joint_effort_command_[j]);
-      ej_interface_.registerHandle(joint_handle);
+      joint_handle = new hardware_interface::JointHandle(js_interface_.getHandle(joint_names_[j]),
+                                                         &joint_effort_command_[j]);
+      ej_interface_.registerHandle(*joint_handle);
+      joint_handles_.push_back(joint_handle);
     }
     else if(hardware_interface == "PositionJointInterface" || hardware_interface == "hardware_interface/PositionJointInterface")
     {
       // Create position joint interface
       joint_control_methods_[j] = POSITION;
-      joint_handle = hardware_interface::JointHandle(js_interface_.getHandle(joint_names_[j]),
-                                                     &joint_position_command_[j]);
-      pj_interface_.registerHandle(joint_handle);
+      joint_handle = new hardware_interface::JointHandle(js_interface_.getHandle(joint_names_[j]),
+                                                         &joint_position_command_[j]);
+      pj_interface_.registerHandle(*joint_handle);
+      joint_handles_.push_back(joint_handle);
     }
     else if(hardware_interface == "VelocityJointInterface" || hardware_interface == "hardware_interface/VelocityJointInterface")
     {
       // Create velocity joint interface
       joint_control_methods_[j] = VELOCITY;
-      joint_handle = hardware_interface::JointHandle(js_interface_.getHandle(joint_names_[j]),
-                                                     &joint_velocity_command_[j]);
-      vj_interface_.registerHandle(joint_handle);
+      joint_handle = new hardware_interface::JointHandle(js_interface_.getHandle(joint_names_[j]),
+                                                         &joint_velocity_command_[j]);
+      vj_interface_.registerHandle(*joint_handle);
+      joint_handles_.push_back(joint_handle);
+    }
+    else if(hardware_interface == "PosVelJointInterface" || hardware_interface == "hardware_interface/PosVelJointInterface")
+    {
+      // Create position velocity joint interface
+      joint_control_methods_[j] = POS_VEL;
+      auto pos_vel_handle = new hardware_interface::PosVelJointHandle(js_interface_.getHandle(joint_names_[j]),
+                                                                      &joint_position_command_[j],
+                                                                      &joint_velocity_command_[j]);
+      joint_handle = reinterpret_cast<hardware_interface::JointHandle*>(pos_vel_handle);
+      // joint_handle = hardware_interface::PosVelJointHandle(js_interface_.getHandle(joint_names_[j]),
+      //                                                      &joint_position_command_[j],
+      //                                                      &joint_velocity_command_[j]);
+      pvj_interface_.registerHandle(*pos_vel_handle);
+      pos_vel_joint_handles_.push_back(pos_vel_handle);
     }
     else
     {
@@ -209,11 +232,12 @@ bool DefaultRobotHWSim::initSim(
       ROS_WARN_STREAM_NAMED("default_robot_hw_sim", "No physics type found.");
     }
 
-    registerJointLimits(joint_names_[j], joint_handle, joint_control_methods_[j],
+    registerJointLimits(joint_names_[j], *joint_handle, joint_control_methods_[j],
                         joint_limit_nh, urdf_model,
                         &joint_types_[j], &joint_lower_limits_[j], &joint_upper_limits_[j],
                         &joint_effort_limits_[j]);
-    if (joint_control_methods_[j] != EFFORT)
+
+    if (joint_control_methods_[j] != EFFORT && joint_control_methods_[j] != POS_VEL)
     {
       // Initialize the PID controller. If no PID gain values are found, use joint->SetAngle() or
       // joint->SetParam("vel") to control the joint.
@@ -250,6 +274,7 @@ bool DefaultRobotHWSim::initSim(
   registerInterface(&ej_interface_);
   registerInterface(&pj_interface_);
   registerInterface(&vj_interface_);
+  registerInterface(&pvj_interface_);
 
   // Initialize the emergency stop code.
   e_stop_active_ = false;
@@ -372,15 +397,40 @@ void DefaultRobotHWSim::writeSim(ros::Time time, ros::Duration period)
         break;
 
       case VELOCITY_PID:
-        double error;
-        if (e_stop_active_)
-          error = -joint_velocity_[j];
-        else
-          error = joint_velocity_command_[j] - joint_velocity_[j];
-        const double effort_limit = joint_effort_limits_[j];
-        const double effort = clamp(pid_controllers_[j].computeCommand(error, period),
-                                    -effort_limit, effort_limit);
-        sim_joints_[j]->SetForce(0, effort);
+        {
+          double error;
+          if (e_stop_active_)
+            error = -joint_velocity_[j];
+          else
+            error = joint_velocity_command_[j] - joint_velocity_[j];
+          const double effort_limit = joint_effort_limits_[j];
+          const double effort = clamp(pid_controllers_[j].computeCommand(error, period),
+                                      -effort_limit, effort_limit);
+          sim_joints_[j]->SetForce(0, effort);
+          break;
+        }
+      case POS_VEL:
+#if GAZEBO_MAJOR_VERSION >= 9
+        sim_joints_[j]->SetPosition(0, joint_position_command_[j], true);
+#else
+        ROS_WARN_ONCE("The default_robot_hw_sim plugin is using the Joint::SetPosition method without preserving the link velocity.");
+        ROS_WARN_ONCE("As a result, gravity will not be simulated correctly for your model.");
+        ROS_WARN_ONCE("Please set gazebo_pid parameters, switch to the VelocityJointInterface or EffortJointInterface, or upgrade to Gazebo 9.");
+        ROS_WARN_ONCE("For details, see https://github.com/ros-simulation/gazebo_ros_pkgs/issues/612");
+        sim_joints_[j]->SetPosition(0, joint_position_command_[j]);
+#endif
+#if GAZEBO_MAJOR_VERSION > 2
+        if (physics_type_.compare("ode") == 0)
+        {
+          sim_joints_[j]->SetParam("vel", 0, e_stop_active_ ? 0 : joint_velocity_command_[j]);
+        }
+        else 
+        {
+          sim_joints_[j]->SetVelocity(0, e_stop_active_ ? 0 : joint_velocity_command_[j]);
+        }
+#else
+        sim_joints_[j]->SetVelocity(0, e_stop_active_ ? 0 : joint_velocity_command_[j]);
+#endif
         break;
     }
   }
@@ -482,6 +532,16 @@ void DefaultRobotHWSim::registerJointLimits(const std::string& joint_name,
           vj_limits_interface_.registerHandle(limits_handle);
         }
         break;
+      case POS_VEL:
+        {
+          const joint_limits_interface::PositionJointSoftLimitsHandle
+            pos_limits_handle(joint_handle, limits, soft_limits);
+          pj_limits_interface_.registerHandle(pos_limits_handle);
+          const joint_limits_interface::VelocityJointSoftLimitsHandle
+            vel_limits_handle(joint_handle, limits, soft_limits);
+          vj_limits_interface_.registerHandle(vel_limits_handle);
+        }
+        break;
     }
   }
   else
@@ -507,6 +567,16 @@ void DefaultRobotHWSim::registerJointLimits(const std::string& joint_name,
           const joint_limits_interface::VelocityJointSaturationHandle
             sat_handle(joint_handle, limits);
           vj_sat_interface_.registerHandle(sat_handle);
+        }
+        break;
+      case POS_VEL:
+        {
+          const joint_limits_interface::PositionJointSaturationHandle
+            pos_sat_handle(joint_handle, limits);
+          pj_sat_interface_.registerHandle(pos_sat_handle);
+          const joint_limits_interface::VelocityJointSaturationHandle
+            vel_sat_handle(joint_handle, limits);
+          vj_sat_interface_.registerHandle(vel_sat_handle);
         }
         break;
     }
